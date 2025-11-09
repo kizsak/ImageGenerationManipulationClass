@@ -1,0 +1,44 @@
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+import numpy as np, random
+
+# --- Paths ---
+in_path = "input.jpg"        # your source image (B/W or grayscale)
+out_path = "output_cyanotype_painted.jpg"
+
+# --- Load and prepare image ---
+im = Image.open(in_path).convert("L")  # convert to grayscale
+im = ImageOps.autocontrast(im, cutoff=1)
+im = ImageEnhance.Contrast(im).enhance(1.1)
+
+# --- Cyanotype tone mapping ---
+deep_blue = "#1b3358"   # deep Prussian blue
+light_blue = "#dbe7f3"  # pale sky-blue
+colored = ImageOps.colorize(im, black=deep_blue, white=light_blue)
+
+# --- Create a hand-painted uneven wash mask ---
+w, h = colored.size
+mask = np.zeros((h, w), dtype=np.float32)
+
+for _ in range(500):  # random layered patches
+    cx, cy = random.randint(0, w), random.randint(0, h)
+    rx, ry = random.randint(100, 300), random.randint(100, 300)
+    intensity = random.uniform(0.2, 0.6)
+    y, x = np.ogrid[:h, :w]
+    d = ((x - cx)**2 / rx**2 + (y - cy)**2 / ry**2)
+    patch = np.exp(-d * 4) * intensity
+    mask += patch
+
+mask = np.clip(mask / mask.max(), 0, 1)
+mask = Image.fromarray((mask * 255).astype("uint8")).filter(ImageFilter.GaussianBlur(30))
+mask = mask.resize(colored.size)
+
+# --- Blend uneven wash overlay ---
+overlay = Image.new("RGB", colored.size, "#f5f9ff")  # slightly off-white paper tone
+colored = Image.composite(colored, overlay, mask)
+
+# --- Optional paper grain / softness ---
+colored = colored.filter(ImageFilter.GaussianBlur(0.4))
+
+# --- Save result ---
+colored.save(out_path)
+print("Saved:", out_path)
