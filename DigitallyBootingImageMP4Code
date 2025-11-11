@@ -1,0 +1,419 @@
+import argparse, math, os, random
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+import imageio.v2 as imageio
+
+# ----------------------------
+# Utils
+# ----------------------------
+def clamp01(x):
+    return np.clip(x, 0.0, 1.0)
+
+def to_uint8(img01):
+    return (clamp01(img01) * 255.0 + 0.5).astype(np.uint8)
+
+def smoothstep(a, b, x):
+    t = clamp01((x - a) / (b - a + 1e-8))
+    return t * t * (3 - 2 * t)
+
+def ease_in_out_cubic(t):
+    return 4*t*t*t if t < 0.5 else 1 - pow(-2*t + 2, 3)/2
+
+def ease_out_quint(t):
+    return 1 - pow(1 - t, 5)
+
+def pil_to_np_rgb(im):
+    return np.asarray(im.convert("RGB"), dtype=np.uint8)
+
+def np_to_pil(arr):
+    return Image.fromarray(arr.astype(np.uint8), "RGB")
+
+# ----------------------------
+# Fast value noise (for displacement & flicker)
+# ----------------------------
+def value_noise_2d(h, w, cell=32, seed=0, octaves=3, persistence=0.5):
+    rng = np.random.RandomState(seed)
+    base = np.zeros((h, w), dtype=np.float32)
+    amp_sum = 0.0
+    for o in range(octaves):
+        c = max(4, cell // (2**o))
+        gh, gw = (h // c) + 3, (w // c) + 3
+        grid = rng.rand(gh, gw).astype(np.float32)
+        ys = (np.arange(h, dtype=np.float32) / c) + 1.0
+        xs = (np.arange(w, dtype=np.float32) / c) + 1.0
+        yi = ys.astype(np.int32)
+        xi = xs.astype(np.int32)
+        yf = ys - yi
+        xf = xs - xi
+        v00 = grid[yi[:, None], xi[None, :]]
+        v10 = grid[(yi+1)[:, None], xi[None, :]]
+        v01 = grid[yi[:, None], (xi+1)[None, :]]
+        v11 = grid[(yi+1)[:, None], (xi+1)[None, :]]
+        sx = xf[None, :]
+        sy = yf[:, None]
+        sx = sx * sx * (3 - 2 * sx)
+        sy = sy * sy * (3 - 2 * sy)
+        a = v00 * (1 - sx) + v01 * sx
+        b = v10 * (1 - sx) + v11 * sx
+        octave = a * (1 - sy) + b * sy
+        amp = (persistence ** o)
+        amp_sum += amp
+        base += octave * amp
+    return clamp01(base / (amp_sum + 1e-8))
+
+# ----------------------------
+# Effects
+# ----------------------------
+def crt_scanlines(h, w, strength=0.25):
+    """Dark lines every other row, softened toward edges."""
+    y = np.arange(h)[:, None]
+    lines = ((y % 2) == 0).astype(np.float32)
+    lines = 1.0 - strength * (1.0 - lines)  # 1 on even rows, 1-strength on odd
+    return lines
+
+def vignette_mask(h, w, amount=0.35):
+    ys, xs = np.ogrid[:h, :w]
+    cx, cy = (w-1)/2.0, (h-1)/2.0
+    rx, ry = cx, cy
+    d = np.sqrt(((xs - cx)/(rx+1e-8))**2 + ((ys - cy)/(ry+1e-8))**2)
+    v = 1.0 - smoothstep(0.7, 1.05, d)
+    return (1.0 - amount) + amount * v
+
+def channel_offset(rgb, off_r=(0,0), off_g=(0,0), off_b=(0,0)):
+    r = np.roll(np.roll(rgb[...,0], off_r[0], axis=0), off_r[1], axis=1)
+    g = np.roll(np.roll(rgb[...,1], off_g[0], axis=0), off_g[1], axis=1)
+    b = np.roll(np.roll(rgb[...,2], off_b[0], axis=0), off_b[1], axis=1)
+    return np.stack([r,g,b], axis=-1)
+
+def add_bloom(img01, radius=2, intensity=0.5):
+    if radius <= 0 or intensity <= 0:
+        return img01
+    pil = np_to_pil(to_uint8(img01))
+    blur = np.asarray(pil.filter(ImageFilter.GaussianBlur(radius)), dtype=np.float32) / 255.0
+    return clamp01(img01 + blur * intensity)
+
+def horizontal_tears(rgb, strength_map, max_shift=12):
+    """
+    strength_map: HxW float 0..1 controlling per-row displacement amount
+    Tears shift rows left/right by varying pixels.
+    """
+    H, W, _ = rgb.shape
+    row_strength = strength_map.mean(axis=1)  # per-row scalar
+    sign = np.sign(np.sin(np.linspace(0, math.pi*3, H)))
+    shifts = (row_strength * max_shift * sign).astype(np.int32)
+
+    out = rgb.copy()
+    for y in range(H):
+        s = shifts[y]
+        if s != 0:
+            out[y] = np.roll(rgb[y], s, axis=1)
+    return out
+
+def glitch_bands(rgb, rng, probability=0.08, max_bands=4, intensity=0.35):
+    """
+    Overlay random horizontal bands with noise/pixelation.
+    Guarantees exact shape alignment to avoid broadcasting errors.
+    """
+    H, W, C = rgb.shape
+    out = rgb.astype(np.float32) / 255.0
+
+    # Decide number of bands (more likely 0 unless probability triggers)
+    bands = rng.randint(0, max_bands + 1)
+    if rng.rand() < probability:
+        bands = max(bands, 1)
+
+    for _ in range(bands):
+        y0 = rng.randint(0, max(1, H - 2))
+        # band height within a reasonable range relative to H
+        h = rng.randint(2, max(3, H // 25))
+
+        # Base noise block
+        patch = rng.rand(h, W, C).astype(np.float32)
+
+        # Pixelate by down/upsampling with integer block size
+        block = rng.randint(2, 8)
+        small_h = max(1, h // block)
+        small_w = max(1, W // block)
+        small = rng.rand(small_h, small_w, C).astype(np.float32)
+
+        # Upsample via repeat, then enforce exact (h, W, C)
+        patch = np.repeat(np.repeat(small, block, axis=0), block, axis=1)
+        if patch.shape[0] < h:
+            reps = math.ceil(h / patch.shape[0])
+            patch = np.tile(patch, (reps, 1, 1))
+        if patch.shape[1] < W:
+            reps = math.ceil(W / patch.shape[1])
+            patch = np.tile(patch, (1, reps, 1))
+        patch = patch[:h, :W, :]
+
+        # Mix band
+        alpha = intensity * rng.rand()
+        y1 = min(H, y0 + h)
+        h_eff = y1 - y0
+        if h_eff <= 0:
+            continue
+        band_existing = out[y0:y1]
+        band_patch = patch[:h_eff]
+        out[y0:y1] = clamp01(band_existing * (1 - alpha) + band_patch * alpha)
+
+    return to_uint8(out)
+
+def rolling_flicker(h, w, t, speed=2.5, strength=0.35):
+    """
+    Vertical brightness bar that scrolls downward over time.
+    """
+    y = np.linspace(0, 1, h, dtype=np.float32)[:, None]
+    phase = (t * speed) % 1.0
+    band = np.exp(-((y - phase) ** 2) / (2 * (0.06 ** 2)))
+    band = (band - band.min()) / (band.max() - band.min() + 1e-8)
+    return 1.0 + strength * (band - 0.5)  # ~0.825..1.175
+
+def timed_boot_overlay(size, t, lines, mono_font=None, max_alpha=200):
+    """
+    Render a fake boot log with progressive reveal.
+    t: 0..1 controls how many lines/characters are visible.
+    """
+    W, H = size
+    img = Image.new("L", (W, H), 0)
+    draw = ImageDraw.Draw(img)
+
+    if mono_font is None:
+        try:
+            mono_font = ImageFont.truetype("DejaVuSansMono.ttf", 14)
+        except:
+            mono_font = ImageFont.load_default()
+
+    margin = 16
+    lh = mono_font.getbbox("A")[3] - mono_font.getbbox("A")[1] + 2
+    total_chars = sum(len(s) for s in lines) + len(lines)
+    reveal_chars = int(total_chars * smoothstep(0.0, 0.85, t))
+    alpha = int(max_alpha * (1.0 - smoothstep(0.9, 1.0, t)))
+
+    y = margin
+    remaining = reveal_chars
+    for s in lines:
+        if remaining <= 0:
+            break
+        text = s
+        if remaining < len(s):
+            text = s[:remaining]
+            remaining = 0
+        else:
+            remaining -= len(s) + 1
+        draw.text((margin, y), text, fill=alpha, font=mono_font)
+        y += lh
+        if y > H - margin:
+            break
+
+    return img  # L mode alpha
+
+# ----------------------------
+# Core frame composer
+# ----------------------------
+def compose_frame(src_u8, t, rng, params, shared_noise=None):
+    """
+    t: 0..1 progress
+    """
+    H, W, _ = src_u8.shape
+    src01 = src_u8.astype(np.float32) / 255.0
+
+    rec = ease_in_out_cubic(t)  # 0..1
+
+    # 1) Channel misalignment shrinks over time
+    max_pix = params["max_channel_shift"]
+    s = int(round((1.0 - rec) * max_pix))
+    offs = (
+        (rng.randint(-s, s+1) if s>0 else 0, rng.randint(-s, s+1) if s>0 else 0),
+        (rng.randint(-s, s+1) if s>0 else 0, rng.randint(-s, s+1) if s>0 else 0),
+        (rng.randint(-s, s+1) if s>0 else 0, rng.randint(-s, s+1) if s>0 else 0),
+    )
+    rgb = channel_offset(src_u8, off_r=offs[0], off_g=offs[1], off_b=offs[2])
+
+    # 2) Horizontal tears driven by noise; decay with time
+    if shared_noise is None:
+        shared_noise = value_noise_2d(H, W, cell=48, seed=params["seed"])
+    tear_strength = (1.0 - rec) ** 1.2
+    rgb = horizontal_tears(rgb, shared_noise * tear_strength, max_shift=params["max_tear_shift"])
+
+    # 3) Convert to float for grading
+    img01 = rgb.astype(np.float32) / 255.0
+
+    # 4) Rolling flicker & scanlines (fade out toward end)
+    flicker = rolling_flicker(H, W, t, speed=2.3, strength=params["flicker_strength"] * (1.0 - rec))
+    img01 = clamp01(img01 * flicker[..., None])
+    scan = crt_scanlines(H, W, strength=params["scanline_strength"] * (1.0 - rec * 0.9))
+    img01 = img01 * scan[..., None]
+
+    # 5) Bloom early, reduce later
+    if params["bloom_intensity"] > 0:
+        img01 = add_bloom(img01, radius=params["bloom_radius"], intensity=params["bloom_intensity"] * (0.6 + 0.4*(1.0 - rec)))
+
+    # 6) Subtle color drift early
+    if params["color_drift"] > 0:
+        drift = (1.0 - rec) * params["color_drift"]
+        img01[...,0] = clamp01(img01[...,0] * (1 + drift*0.6))
+        img01[...,2] = clamp01(img01[...,2] * (1 - drift*0.6))
+
+    # 7) Random glitch bands occasionally, more common early
+    if rng.rand() < (0.5 * (1.0 - rec) + 0.05):
+        img_u8 = to_uint8(img01)
+        img_u8 = glitch_bands(img_u8, rng, probability=0.75, max_bands=3, intensity=0.25 + 0.3*(1.0 - rec))
+        img01 = img_u8.astype(np.float32) / 255.0
+
+    # 8) Vignette (slight, pulsing)
+    vig_amt = params["vignette"] * (0.8 + 0.2 * math.sin(2*math.pi*(t*1.2)))
+    vmask = vignette_mask(H, W, amount=vig_amt)
+    img01 *= vmask[..., None]
+
+    # 9) Boot overlay text (fades as system “stabilizes”)
+    if params["overlay_enabled"]:
+        overlay_img = timed_boot_overlay((W, H), t, params["boot_lines"], mono_font=params["font"], max_alpha=params["overlay_alpha"])
+        if overlay_img is not None:
+            overlay = np.asarray(overlay_img, dtype=np.float32) / 255.0
+            overlay = overlay[..., None]
+            img01 = clamp01(img01 + overlay * (params["overlay_intensity"] * (1.0 - smoothstep(0.7, 1.0, t))))
+
+    # 10) Toward the end, hard-resolve to the source for clarity
+    if t >= 0.999 and not params["keep_look_final"]:
+        return src_u8
+
+    return to_uint8(img01)
+
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Digital Resurrection — a glitchy boot-up reveal that resolves to the original image.")
+    ap.add_argument("-i", "--input", required=True, help="Path to input image")
+    ap.add_argument("-o", "--output", default="digital_resurrection.gif", help="Output file (.gif or .mp4)")
+    ap.add_argument("--seconds", type=float, default=6.0, help="Duration")
+    ap.add_argument("--fps", type=int, default=24, help="Frames per second")
+    ap.add_argument("--max-width", type=int, default=900, help="Resize input to this max width (preserves aspect)")
+    ap.add_argument("--seed", type=int, default=123, help="Random seed")
+
+    # Look controls
+    ap.add_argument("--scanlines", type=float, default=0.28, help="Scanline strength (0..1)")
+    ap.add_argument("--flicker", type=float, default=0.35, help="Rolling flicker strength (0..1)")
+    ap.add_argument("--bloom-radius", type=int, default=2, help="Bloom blur radius")
+    ap.add_argument("--bloom-intensity", type=float, default=0.45, help="Bloom intensity (0..1)")
+    ap.add_argument("--color-drift", type=float, default=0.12, help="Early color drift amount (0..0.5)")
+    ap.add_argument("--vignette", type=float, default=0.25, help="Vignette amount (0..1)")
+    ap.add_argument("--channel-shift", type=int, default=5, help="Max per-channel pixel shift early on")
+    ap.add_argument("--tear-shift", type=int, default=14, help="Max per-row tear shift early on")
+
+    # Overlay text
+    ap.add_argument("--no-overlay", action="store_true", help="Disable boot log overlay")
+    ap.add_argument("--overlay-alpha", type=int, default=200, help="Max alpha for overlay text (0..255)")
+    ap.add_argument("--overlay-intensity", type=float, default=0.55, help="Additive intensity of overlay (0..1)")
+
+    # Final frame behavior
+    ap.add_argument("--keep-look-final", action="store_true", help="Keep CRT/glitch look on final frame (otherwise snap to clean source)")
+    ap.add_argument("--mp4", action="store_true", help="Force MP4 output")
+
+    args = ap.parse_args()
+
+    # Load image
+    src = Image.open(args.input).convert("RGB")
+    if src.width > args.max_width:
+        nh = int(src.height * (args.max_width / src.width))
+        src = src.resize((args.max_width, nh), Image.LANCZOS)
+
+    # Gentle pre-contrast to help pop
+    src = ImageOps.autocontrast(src, cutoff=1)
+
+    src_u8 = pil_to_np_rgb(src)
+    H, W, _ = src_u8.shape
+
+    # Boot log lines (edit freely)
+    boot_lines = [
+        "[BOOT] Kernel v3.92 — initializing...",
+        "[INIT] Video subsystem... OK",
+        "[INIT] Memory map... OK",
+        "[INIT] Disk controller... OK",
+        "[MOUNT] /dev/archive0 -> /mnt/vault ...",
+        "[CHECK] Journal integrity... CLEAN",
+        "[SCAN] Recoverable assets: 1",
+        "[HASH] 1c8e1a... verified",
+        "[DECODE] LUMA/CHROMA alignment... in progress",
+        "[REPAIR] Pixel matrix drift... compensated",
+        "[LOAD] asset: photo_legacy.tif",
+        "[STATUS] Rendering surface...",
+        "[READY] Press any key to continue_"
+    ]
+
+    # Optional font
+    font = None
+    try:
+        font = ImageFont.truetype("DejaVuSansMono.ttf", 14)
+    except:
+        try:
+            font = ImageFont.truetype("Consolas.ttf", 14)
+        except:
+            font = ImageFont.load_default()
+
+    rng = np.random.RandomState(args.seed)
+    total = max(2, int(round(args.seconds * args.fps)))
+
+       # Determine output path — always save alongside input image unless overridden
+    input_path = Path(args.input)
+    input_dir = input_path.parent
+    input_stem = input_path.stem
+
+    # Figure out whether MP4 or GIF
+    force_mp4 = args.mp4 or args.output.lower().endswith(".mp4")
+
+    # If user didn't give a custom path, save next to input
+    if args.output == "digital_resurrection.gif":
+        suffix = ".mp4" if force_mp4 else ".gif"
+        out_path = input_dir / f"{input_stem}_resurrect{suffix}"
+    else:
+        out_path = Path(args.output)
+        if not out_path.is_absolute():
+            out_path = input_dir / out_path.name
+        if force_mp4:
+            out_path = out_path.with_suffix(".mp4")
+
+    print(f"Input: {args.input}")
+    print(f"Output: {out_path.name}")
+    print(f"Saving to: {out_path.resolve().parent}")
+
+
+    # Precompute a noise field shared by frames for coherent tears
+    shared_noise = value_noise_2d(H, W, cell=48, seed=args.seed, octaves=4, persistence=0.55)
+
+    params = {
+        "seed": args.seed,
+        "scanline_strength": float(args.scanlines),
+        "flicker_strength": float(args.flicker),
+        "bloom_radius": int(args.bloom_radius),
+        "bloom_intensity": float(args.bloom_intensity),
+        "color_drift": float(args.color_drift),
+        "vignette": float(args.vignette),
+        "max_channel_shift": int(args.channel_shift),
+        "max_tear_shift": int(args.tear_shift),
+        "overlay_enabled": not args.no_overlay,
+        "overlay_alpha": int(args.overlay_alpha),
+        "overlay_intensity": float(args.overlay_intensity),
+        "boot_lines": boot_lines,
+        "font": font,
+        "keep_look_final": bool(args.keep_look_final),
+    }
+
+    frames = []
+    for i in range(total):
+        p = i / (total - 1)
+        t = ease_in_out_cubic(p)
+        frm = compose_frame(src_u8, t, rng, params, shared_noise=shared_noise)
+        frames.append(frm)
+
+    if force_mp4:
+        imageio.mimsave(out_path.as_posix(), frames, fps=args.fps, quality=8)
+    else:
+        imageio.mimsave(out_path.as_posix(), frames, duration=1.0/args.fps, loop=0)
+
+    print(f"Saved: {out_path.resolve()}")
+
+if __name__ == "__main__":
+    main()
