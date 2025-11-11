@@ -1,0 +1,195 @@
+import argparse, datetime
+from pathlib import Path
+from typing import Optional
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter, ImageChops
+
+# ---------- helpers ----------
+def fit_cover(img: Image.Image, w: int, h: int) -> Image.Image:
+    """Resize and crop an image to exactly fit a w×h box."""
+    r = img.width / img.height
+    R = w / h
+    if r > R:
+        new_h = h
+        new_w = int(round(h * r))
+    else:
+        new_w = w
+        new_h = int(round(w / r))
+    im = img.resize((new_w, new_h), Image.LANCZOS)
+    x = (new_w - w) // 2
+    y = (new_h - h) // 2
+    return im.crop((x, y, x + w, y + h))
+
+def load_font(size: int) -> ImageFont.FreeTypeFont:
+    for name in ["Arial.ttf", "arial.ttf", "DejaVuSans.ttf"]:
+        try:
+            return ImageFont.truetype(name, size)
+        except:
+            pass
+    return ImageFont.load_default()
+
+def tint_overlay(im: Image.Image, tint: str, strength=0.1):
+    """Gentle color wash (bright microfiche film tone)."""
+    t = tint.lower()
+    if t.startswith("amb"):      color = (255, 225, 180)
+    elif t.startswith("blue"):   color = (190, 205, 235)
+    elif t.startswith("green"):  color = (195, 225, 200)
+    else:
+        try:
+            r,g,b = [int(x) for x in t.split(",")]
+            color = (r,g,b)
+        except:
+            color = (190,205,235)
+    overlay = Image.new("RGB", im.size, color)
+    return ImageChops.blend(im.convert("RGB"), overlay, strength)
+
+def add_grain(im: Image.Image, amount=0.15):
+    """Add subtle light noise."""
+    if amount <= 0: return im
+    w,h = im.size
+    noise = Image.effect_noise((w,h), 28).convert("L")
+    noise = ImageOps.autocontrast(noise)
+    noise_rgb = Image.merge("RGB",(noise,noise,noise))
+    return ImageChops.blend(im, ImageChops.multiply(im, noise_rgb), amount*0.2)
+
+def vignette_light(im: Image.Image, strength=0.1):
+    """Soft bright vignette (no dark edges)."""
+    if strength <= 0: return im
+    w,h = im.size
+    mask = Image.new("L",(w,h),255)
+    d = ImageDraw.Draw(mask)
+    pad = int(min(w,h)*0.08)
+    d.ellipse((pad,pad,w-pad,h-pad),fill=int(255*(1-strength)))
+    mask = mask.filter(ImageFilter.GaussianBlur(int(min(w,h)*0.07)))
+    mask_rgb = Image.merge("RGB",(mask,mask,mask))
+    return ImageChops.screen(im, mask_rgb)
+
+# ---------- fiche core ----------
+def make_blank_fiche(size=(2400,1700), header_h=180, margin=80,
+                     rows=6, cols=8, cell_gap=10, grid_color=(150,160,170),
+                     header_text="MICROFICHE ARCHIVE", subtitle=None, tint="blue"):
+    """Create a new fiche layout."""
+    W,H = size
+    base = Image.new("RGB",(W,H),(230,235,240))    # bright neutral paper
+    base = tint_overlay(base,tint,0.25)            # gentle color tone
+
+    d = ImageDraw.Draw(base)
+    # header bar
+    d.rectangle((0,0,W,header_h),fill=(210,215,220))
+    font_big = load_font(46)
+    font_small = load_font(24)
+    d.text((margin, int(header_h*0.28)), header_text, fill=(40,45,50), font=font_big)
+    if subtitle:
+        d.text((margin, int(header_h*0.62)), subtitle, fill=(60,65,70), font=font_small)
+
+    today = datetime.date.today().isoformat()
+    meta = f"RATIO 24x  •  {today}"
+    tw = d.textlength(meta,font=font_small)
+    d.text((W-margin-tw,int(header_h*0.32)),meta,fill=(60,65,70),font=font_small)
+
+    gx0,gy0 = margin, header_h+margin
+    gx1,gy1 = W-margin,H-margin
+    gw,gh = gx1-gx0, gy1-gy0
+    cw = (gw - (cols-1)*cell_gap)//cols
+    ch = (gh - (rows-1)*cell_gap)//rows
+
+    d.rectangle((gx0,gy0,gx1,gy1),outline=None,fill=(245,245,245))
+    gc=grid_color
+    for c in range(cols+1):
+        x = gx0 + c*(cw+cell_gap) - (cell_gap if c==cols else 0)
+        d.line((x,gy0,x,gy1),fill=gc,width=1)
+    for r in range(rows+1):
+        y = gy0 + r*(ch+cell_gap) - (cell_gap if r==rows else 0)
+        d.line((gx0,y,gx1,y),fill=gc,width=1)
+
+    # labels
+    font_idx=load_font(20)
+    for c in range(cols):
+        label=str(c+1)
+        x=gx0+c*(cw+cell_gap)+cw//2
+        d.text((x-6,gy0-26),label,fill=(80,85,95),font=font_idx)
+    letters="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for r in range(rows):
+        label=letters[r]
+        y=gy0+r*(ch+cell_gap)+ch//2-10
+        d.text((gx0-30,y),label,fill=(80,85,95),font=font_idx)
+
+    return base,(gx0,gy0,cw,ch,cell_gap)
+
+def paste_into_slot(sheet: Image.Image, grid_info, img: Image.Image,
+                    slot_row:int,slot_col:int,pad=12,caption:Optional[str]=None):
+    gx0,gy0,cw,ch,gap=grid_info
+    x=gx0+slot_col*(cw+gap)
+    y=gy0+slot_row*(ch+gap)
+    cell_w=max(1,cw-pad*2)
+    cell_h=max(1,ch-pad*2)
+
+    fitted=fit_cover(img,cell_w,cell_h)
+    sheet.paste(fitted,(x+pad,y+pad))
+    d=ImageDraw.Draw(sheet)
+    if caption:
+        font=load_font(18)
+        tw=d.textlength(caption,font=font)
+        cx=x+(cw-tw)//2
+        cy=y+ch-pad-font.size-2
+        d.rectangle((x+pad,cy-2,x+cw-pad,cy+font.size+2),fill=(235,235,235))
+        d.text((cx,cy),caption,fill=(40,45,50),font=font)
+
+def finalize(sheet:Image.Image,tint="blue",grain=0.1,vignette=0.1)->Image.Image:
+    out=add_grain(sheet,amount=grain)
+    out=tint_overlay(out,tint,0.1)
+    out=vignette_light(out,strength=vignette)
+    d=ImageDraw.Draw(out)
+    W,H=out.size
+    d.rectangle((4,4,W-5,H-5),outline=(130,135,140),width=1)
+    return out
+
+# ---------- CLI ----------
+def main():
+    ap=argparse.ArgumentParser(description="Bright microfiche sheet generator")
+    ap.add_argument("--input",help="Photo to place (optional for blank sheet)")
+    ap.add_argument("--base",help="Existing fiche PNG (optional)")
+    ap.add_argument("--outdir",default="output")
+    ap.add_argument("--rows",type=int,default=6)
+    ap.add_argument("--cols",type=int,default=8)
+    ap.add_argument("--slot",default="0,0",help="row,col (0-indexed)")
+    ap.add_argument("--title",default="MICROFICHE ARCHIVE")
+    ap.add_argument("--subtitle",default=None)
+    ap.add_argument("--tint",default="blue")
+    ap.add_argument("--grain",type=float,default=0.1)
+    ap.add_argument("--vignette",type=float,default=0.1)
+    ap.add_argument("--size",default="2400x1700",help="WxH for new sheets")
+    ap.add_argument("--caption",default=None)
+    args=ap.parse_args()
+
+    outdir=Path(args.outdir); outdir.mkdir(parents=True,exist_ok=True)
+    W,H=[int(v) for v in args.size.lower().split("x")] if "x" in args.size.lower() else (2400,1700)
+    r,c=[int(v) for v in args.slot.split(",")]
+
+    if args.base:
+        sheet=Image.open(args.base).convert("RGB")
+        header_h,margin,gap=180,80,10
+        gx0,gy0=margin,header_h+margin
+        gx1,gy1=sheet.width-margin,sheet.height-margin
+        gw,gh=gx1-gx0,gy1-gy0
+        cw=(gw-(args.cols-1)*gap)//args.cols
+        ch=(gh-(args.rows-1)*gap)//args.rows
+        grid_info=(gx0,gy0,cw,ch,gap)
+    else:
+        sheet,grid_info=make_blank_fiche(
+            size=(W,H),header_h=180,margin=80,
+            rows=args.rows,cols=args.cols,
+            cell_gap=10,header_text=args.title,
+            subtitle=args.subtitle,tint=args.tint)
+
+    if args.input:
+        photo=Image.open(args.input).convert("RGB")
+        paste_into_slot(sheet,grid_info,photo,slot_row=r,slot_col=c,caption=args.caption)
+
+    out=finalize(sheet,tint=args.tint,grain=args.grain,vignette=args.vignette)
+    name=f"fiche_{Path(args.input).stem if args.input else 'blank'}_{args.rows}x{args.cols}_r{r}c{c}.png"
+    out_path=outdir/name
+    out.save(out_path,"PNG")
+    print(f"Saved: {out_path}")
+
+if __name__=="__main__":
+    main()
