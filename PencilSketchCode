@@ -1,0 +1,21 @@
+# pip install opencv-python
+import cv2
+
+img = cv2.imread("portrait.jpg")                      # your file
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+# --- Pencil sketch look (dodge blend) ---
+inv = 255 - gray
+blur = cv2.GaussianBlur(inv, (0,0), sigmaX=25, sigmaY=25)
+pencil = cv2.divide(gray, 255 - blur, scale=256)      # brighter = lighter paper
+
+cv2.imwrite("portrait_pencil.jpg", pencil)
+
+# --- Crisp line drawing (Canny + thinning-ish) ---
+edges = cv2.Canny(gray, 80, 180)                      # tweak thresholds
+edges = 255 - edges                                   # black lines on white
+# Optional: thicken lines slightly
+kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
+edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+cv2.imwrite("portrait_lines.jpg", edges)
