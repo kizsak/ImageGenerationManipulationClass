@@ -1,0 +1,297 @@
+import argparse, math, os
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageFilter, ImageOps
+import imageio.v2 as imageio
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def clamp01(x):
+    return np.clip(x, 0.0, 1.0)
+
+def smoothstep(edge0, edge1, x):
+    # classic smoothstep
+    t = clamp01((x - edge0) / (edge1 - edge0 + 1e-8))
+    return t * t * (3.0 - 2.0 * t)
+
+def ease_in_out_quint(t):
+    return 16*t**5 if t < 0.5 else 1 - (-2*t + 2)**5/2
+
+def to_uint8(img01):
+    return (clamp01(img01) * 255.0 + 0.5).astype(np.uint8)
+
+def pil_to_array_rgb(im):
+    return np.asarray(im.convert("RGB"), dtype=np.uint8)
+
+def array_to_pil_rgb(arr):
+    return Image.fromarray(arr.astype(np.uint8), mode="RGB")
+
+
+# ----------------------------
+# Noise field (fast multi-octave value noise)
+# ----------------------------
+def value_noise(shape, cell=32, octaves=4, persistence=0.5, seed=0):
+    """
+    Fast(ish) value noise by tiled random grids + bilinear interpolation + octave summation.
+    Returns float32 in [0,1].
+    """
+    h, w = shape
+    rng = np.random.RandomState(seed)
+    field = np.zeros((h, w), dtype=np.float32)
+    amp_sum = 0.0
+
+    for o in range(octaves):
+        cells = max(4, cell // (2**o))
+        gh, gw = (h // cells) + 3, (w // cells) + 3  # pad a bit for edges
+        grid = rng.rand(gh, gw).astype(np.float32)
+
+        # Build coordinate maps
+        ys = (np.arange(h, dtype=np.float32) / cells) + 1.0
+        xs = (np.arange(w, dtype=np.float32) / cells) + 1.0
+        yi = ys.astype(np.int32)
+        xi = xs.astype(np.int32)
+        yf = ys - yi
+        xf = xs - xi
+
+        # grab 4 corners per pixel efficiently
+        v00 = grid[yi[:, None], xi[None, :]]
+        v10 = grid[(yi+1)[:, None], xi[None, :]]
+        v01 = grid[yi[:, None], (xi+1)[None, :]]
+        v11 = grid[(yi+1)[:, None], (xi+1)[None, :]]
+
+        # smoothstep on fractions for softer interpolation
+        sx = xf[None, :]
+        sy = yf[:, None]
+        sx = sx * sx * (3.0 - 2.0 * sx)
+        sy = sy * sy * (3.0 - 2.0 * sy)
+
+        a = v00 * (1 - sx) + v01 * sx
+        b = v10 * (1 - sx) + v11 * sx
+        octave = a * (1 - sy) + b * sy
+
+        amp = (persistence ** o)
+        amp_sum += amp
+        field += octave * amp
+
+    field /= (amp_sum + 1e-8)
+    return clamp01(field)
+
+
+# ----------------------------
+# Look effects
+# ----------------------------
+def add_grain(img01, amount=0.08, seed=0):
+    """img01: HxWx3 in 0..1"""
+    if amount <= 0:
+        return img01
+    rng = np.random.RandomState(seed)
+    noise = rng.randn(*img01.shape).astype(np.float32) * amount
+    out = img01 + noise
+    return clamp01(out)
+
+def vignette_mask(h, w, strength=0.35):
+    ys, xs = np.ogrid[:h, :w]
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    rx, ry = cx, cy
+    d = np.sqrt(((xs - cx) / (rx + 1e-8))**2 + ((ys - cy) / (ry + 1e-8))**2)
+    v = 1.0 - smoothstep(0.65, 1.05, d)
+    return (1.0 - strength) + strength * v
+
+def bloom(img01, radius=3, intensity=0.6):
+    if radius <= 0 or intensity <= 0:
+        return img01
+    im = array_to_pil_rgb(to_uint8(img01))
+    blur = im.filter(ImageFilter.GaussianBlur(radius=radius))
+    blur = np.asarray(blur, dtype=np.float32) / 255.0
+    out = clamp01(img01 + blur * intensity)
+    return out
+
+def tint_chem(img01, t, start_hex=(200, 220, 240), mid_hex=(210, 200, 180), end_hex=(255, 255, 255)):
+    """
+    Simulate chemical color cast: bluish -> tea/amber -> neutral
+    """
+    s = ease_in_out_quint(clamp01(t))
+    # two-stage: 0..0.6 mix toward mid, 0.6..1 mix toward end
+    if s < 0.6:
+        u = s / 0.6
+        target = np.array(mid_hex, dtype=np.float32) / 255.0
+    else:
+        u = (s - 0.6) / 0.4
+        target = np.array(end_hex, dtype=np.float32) / 255.0
+
+    start = np.array(start_hex, dtype=np.float32) / 255.0
+    # progressive neutralization
+    color = (1 - s) * start + s * target
+    return clamp01(img01 * (0.9 + 0.1 * s) + color * (0.15 * (1 - s)))
+
+
+# ----------------------------
+# Core frame composer
+# ----------------------------
+def compose_frame(src_rgb_u8, base_noise, t, params, rng):
+    """
+    src_rgb_u8: HxWx3 uint8
+    base_noise: HxW float32 in [0,1]
+    t: 0..1
+    params: dict of knobs
+    """
+    H, W, _ = src_rgb_u8.shape
+    src = src_rgb_u8.astype(np.float32) / 255.0
+
+    # Agitation ripples: small moving sin perturbation
+    y = np.linspace(0, 1, H, dtype=np.float32)[:, None]
+    x = np.linspace(0, 1, W, dtype=np.float32)[None, :]
+    ripple = 0.12 * np.sin(2 * math.pi * (params["ripple_fx"] * x + params["ripple_fy"] * y + params["ripple_speed"] * t))
+    n_t = clamp01(base_noise + ripple)
+
+    # Reveal mask: threshold drifts from ~1 -> 0 so more pixels "develop"
+    thr = 1.0 - t  # high early (nothing), low late (everything)
+    k = params["reveal_softness"]
+    mask = smoothstep(thr - k, thr + k, n_t)  # 0..1, smooth edge at the dev front
+
+    # Make the final frames pop to full 1.0
+    if t >= 0.999:
+        mask = np.ones_like(n_t, dtype=np.float32)
+
+    # Early milky bath: blend toward a fog color where not yet developed
+    fog_color = np.array(params["fog_rgb"], dtype=np.float32) / 255.0
+    fog = np.stack([fog_color[0]*np.ones_like(n_t),
+                    fog_color[1]*np.ones_like(n_t),
+                    fog_color[2]*np.ones_like(n_t)], axis=-1)
+
+    # Slight halation / bloom based on accumulated mask
+    developed = src * mask[..., None] + fog * (1.0 - mask[..., None])
+    if params["bloom_intensity"] > 0:
+        developed = bloom(developed, radius=params["bloom_radius"], intensity=params["bloom_intensity"])
+
+    # Vignette increases as image resolves
+    if params["vignette_strength"] > 0:
+        vmask = vignette_mask(H, W, strength=params["vignette_strength"] * (0.4 + 0.6 * t))
+        developed = developed * vmask[..., None]
+
+    # Subtle global chemical tint evolution
+    if params["chem_tint"]:
+        developed = tint_chem(developed, t,
+                              start_hex=params["chem_start_hex"],
+                              mid_hex=params["chem_mid_hex"],
+                              end_hex=params["chem_end_hex"])
+
+    # Grain that decreases slightly over time
+    if params["grain"] > 0:
+        g_amt = params["grain"] * (0.8 + 0.2 * (1 - t))
+        developed = add_grain(developed, amount=g_amt, seed=rng.randint(0, 2**31 - 1))
+
+    return to_uint8(developed)
+
+
+# ----------------------------
+# Main
+# ----------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Chemical bath reveal animation that fully resolves by the final frame.")
+    ap.add_argument("--input", "-i", required=True, help="Path to input image")
+    ap.add_argument("--output", "-o", default="chemical_reveal.gif", help="Output file (.gif or .mp4)")
+    ap.add_argument("--seconds", type=float, default=5.0, help="Animation duration in seconds")
+    ap.add_argument("--fps", type=int, default=24, help="Frames per second")
+    ap.add_argument("--max-width", type=int, default=900, help="Resize input to this max width (preserves aspect)")
+    ap.add_argument("--seed", type=int, default=1234, help="Random seed")
+    ap.add_argument("--grain", type=float, default=0.06, help="Film grain strength (0..~0.2)")
+    ap.add_argument("--vignette", type=float, default=0.35, help="Vignette strength (0..1)")
+    ap.add_argument("--bloom-radius", type=int, default=3, help="Bloom blur radius in pixels")
+    ap.add_argument("--bloom-intensity", type=float, default=0.45, help="Bloom intensity (0..1)")
+    ap.add_argument("--octaves", type=int, default=5, help="Noise octaves")
+    ap.add_argument("--cell", type=int, default=40, help="Base cell size for noise (higher = larger blobs)")
+    ap.add_argument("--persistence", type=float, default=0.55, help="Noise octave persistence")
+    ap.add_argument("--reveal-softness", type=float, default=0.10, help="Width of the development edge (0.02..0.2)")
+    ap.add_argument("--fog", type=str, default="235,240,245", help="Undeveloped fog RGB, e.g. '230,236,240'")
+    ap.add_argument("--ripples", action="store_true", help="Enable stronger ripples/agitation look")
+    ap.add_argument("--mp4", action="store_true", help="Force MP4 output (overrides extension)")
+    ap.add_argument("--film-look-final", action="store_true", help="Keep subtle film look on the final frame")
+    args = ap.parse_args()
+
+    # I/O
+    src = Image.open(args.input).convert("RGB")
+    if src.width > args.max_width:
+        h = int(src.height * (args.max_width / src.width))
+        src = src.resize((args.max_width, h), Image.LANCZOS)
+
+    # Light cleanup / local contrast to help the reveal feel snappier
+    src = ImageOps.autocontrast(src, cutoff=1)
+    src_rgb = pil_to_array_rgb(src)
+    H, W, _ = src_rgb.shape
+
+    # Parse fog color
+    try:
+        fog_rgb = tuple(int(c) for c in args.fog.split(","))
+        if len(fog_rgb) != 3: raise ValueError
+    except Exception:
+        fog_rgb = (235, 240, 245)
+
+    rng = np.random.RandomState(args.seed)
+
+    # Base noise field
+    base = value_noise((H, W),
+                       cell=args.cell,
+                       octaves=args.octaves,
+                       persistence=args.persistence,
+                       seed=args.seed)
+
+    # Ripple params
+    ripple_fx = 1.8 if args.ripples else 1.0
+    ripple_fy = 1.2 if args.ripples else 0.8
+    ripple_speed = 0.5 if args.ripples else 0.25
+
+    params = {
+        "grain": float(args.grain),
+        "vignette_strength": float(args.vignette),
+        "bloom_radius": int(args.bloom_radius),
+        "bloom_intensity": float(args.bloom_intensity),
+        "reveal_softness": float(args.reveal_softness),
+        "fog_rgb": fog_rgb,
+        "ripple_fx": ripple_fx,
+        "ripple_fy": ripple_fy,
+        "ripple_speed": ripple_speed,
+        "chem_tint": True,
+        "chem_start_hex": (198, 214, 240),
+        "chem_mid_hex":   (210, 195, 175),
+        "chem_end_hex":   (255, 255, 255),
+    }
+
+    # Writer
+    total_frames = max(2, int(round(args.seconds * args.fps)))
+    out_path = Path(args.output)
+    force_mp4 = args.mp4 or out_path.suffix.lower() == ".mp4"
+    if force_mp4:
+        out_path = out_path.with_suffix(".mp4")
+
+    print(f"Input: {args.input}  ->  {out_path.name}")
+    print(f"Frames: {total_frames}  |  Size: {W}x{H}  |  FPS: {args.fps}")
+
+    frames = []
+    for fi in range(total_frames):
+        # progress t: ease in/out for nicer feel
+        p = fi / (total_frames - 1)
+        t = ease_in_out_quint(p)
+        frame = compose_frame(src_rgb, base, t, params, rng)
+
+        # If this is the very last frame, optionally remove film look
+        if fi == total_frames - 1 and not args.film_look_final:
+            frame = src_rgb.copy()
+        frames.append(frame)
+
+    # Save
+    if force_mp4:
+        # MP4 (requires imageio-ffmpeg installed in most environments)
+        imageio.mimsave(out_path.as_posix(), frames, fps=args.fps, quality=8)
+    else:
+        # GIF (palette-optimized)
+        imageio.mimsave(out_path.as_posix(), frames, duration=1.0/args.fps, loop=0)
+
+    print(f"Saved: {out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
