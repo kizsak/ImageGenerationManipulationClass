@@ -1,0 +1,197 @@
+import argparse
+import cv2
+import numpy as np
+
+def read_image(path):
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(f"Could not read {path}")
+    # Convert to 3-channel uint8 RGB if needed
+    if len(img.shape) == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.dtype != np.uint8:
+        # Scale to 8-bit if necessary
+        img = np.clip((img / np.max(img)) * 255, 0, 255).astype(np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
+
+def read_depth(path):
+    d = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if d is None:
+        raise FileNotFoundError(f"Could not read depth map {path}")
+    if len(d.shape) == 3:
+        d = cv2.cvtColor(d, cv2.COLOR_BGR2GRAY)
+    d = d.astype(np.float32)
+    # If 16-bit depth, keep as float; if 8-bit, fine.
+    maxval = np.max(d)
+    if maxval <= 0:
+        maxval = 1.0
+    d /= maxval
+    return d  # 0..1 roughly
+
+def normalize_depth(depth, near=0.0, far=1.0, gamma=1.0, invert=False):
+    d = np.clip((depth - near) / max(far - near, 1e-6), 0.0, 1.0)
+    if invert:
+        d = 1.0 - d
+    if gamma != 1.0:
+        d = np.power(d, gamma)
+    return d
+
+def lerp(a, b, t):
+    return a * (1.0 - t) + b * t
+
+def rgb(*vals):
+    return np.array(vals, dtype=np.float32) / 255.0
+
+PALETTES = {
+    # painterly, depth-friendly
+    "cyanotype": [rgb(245,246,245), rgb(192,205,230), rgb(122,147,196), rgb(62,92,153), rgb(25,46,104)],
+    "sunset":   [rgb(255,219,180), rgb(255,170,120), rgb(255,120,90), rgb(195,80,110), rgb(80,60,140)],
+    "heat":     [rgb(0,0,0), rgb(60,0,80), rgb(120,0,160), rgb(255,100,0), rgb(255,255,0)],
+    "cool":     [rgb(230,245,255), rgb(180,210,240), rgb(130,170,225), rgb(85,130,205), rgb(40,80,170)],
+    "viridis":  [rgb(68,1,84), rgb(59,82,139), rgb(33,145,140), rgb(94,201,98), rgb(253,231,37)],
+}
+
+def sample_gradient(stops, t):
+    # stops: list of RGB (float 0..1), length >= 2
+    t = np.clip(t, 0.0, 1.0)
+    n = len(stops) - 1
+    pos = t * n
+    i0 = np.floor(pos).astype(np.int32)
+    i1 = np.clip(i0 + 1, 0, n)
+    w = (pos - i0)[..., None]
+    s0 = np.array(stops)[i0]
+    s1 = np.array(stops)[i1]
+    return s0 * (1 - w) + s1 * w  # RGB 0..1
+
+def rgb_to_hsv(img):
+    return cv2.cvtColor((img*255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32) / 255.0
+
+def hsv_to_rgb(hsv):
+    rgb8 = cv2.cvtColor((np.clip(hsv,0,1)*255).astype(np.uint8), cv2.COLOR_HSV2RGB)
+    return rgb8.astype(np.float32) / 255.0
+
+def apply_fog(img, depth, fog_color=rgb(200, 220, 255), strength=0.6,
+              contrast_falloff=0.3, sat_falloff=0.25):
+    """
+    Atmospheric tint that increases with depth; optional contrast/sat fade.
+    """
+    imgf = img.astype(np.float32) / 255.0
+    d = depth[..., None]  # expand for channels
+
+    # Contrast & saturation falloff
+    hsv = rgb_to_hsv(imgf)
+    # Reduce saturation and value contrast with depth
+    mean_v = np.mean(hsv[...,2])
+    hsv[...,1] = lerp(hsv[...,1], 0.0, sat_falloff * depth)  # desaturate with depth
+    v = hsv[...,2]
+    v = lerp(v, lerp(v, np.full_like(v, mean_v), depth), contrast_falloff)  # compress contrast
+    hsv[...,2] = v
+    base = hsv_to_rgb(hsv)
+
+    # Fog blend
+    fog = np.broadcast_to(fog_color, imgf.shape)
+    out = lerp(base, fog, depth[...,None] * strength)
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+def apply_hue_shift(img, depth, hue_degrees=60.0, strength=1.0):
+    """
+    Shift hue by (hue_degrees * depth). strength controls blend with original.
+    """
+    imgf = img.astype(np.float32) / 255.0
+    hsv = rgb_to_hsv(imgf)
+    shift = (hue_degrees / 360.0) * depth
+    hsv[...,0] = (hsv[...,0] + shift) % 1.0
+    recolor = hsv_to_rgb(hsv)
+    out = lerp(imgf, recolor, strength)
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+def apply_gradient_map(img, depth, stops, strength=1.0, preserve_luma=True):
+    """
+    Map depth to a multi-stop gradient, then blend onto original.
+    If preserve_luma=True, mix gradient's hue/sat with original luminance for naturalism.
+    """
+    imgf = img.astype(np.float32) / 255.0
+    grad = sample_gradient(stops, depth)[...,:3]
+
+    if preserve_luma:
+        # Convert both to HSV; keep original V, take gradient H/S
+        hsv_img = rgb_to_hsv(imgf)
+        hsv_grad = rgb_to_hsv(grad)
+        hsv_mix = np.stack([hsv_grad[...,0], hsv_grad[...,1], hsv_img[...,2]], axis=-1)
+        mapped = hsv_to_rgb(hsv_mix)
+    else:
+        mapped = grad
+
+    out = lerp(imgf, mapped, strength)
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+def main():
+    ap = argparse.ArgumentParser(description="Depth-aware color mapping")
+    ap.add_argument("--image", required=True, help="Path to RGB image")
+    ap.add_argument("--depth", required=True, help="Path to depth map (8/16-bit, white=further preferred)")
+    ap.add_argument("--mode", choices=["fog","hue","gradient"], default="fog")
+    ap.add_argument("--output", required=True, help="Output image path (PNG/JPG)")
+    ap.add_argument("--near", type=float, default=0.0, help="Depth clip near (0..1 before normalize)")
+    ap.add_argument("--far", type=float, default=1.0, help="Depth clip far (0..1 before normalize)")
+    ap.add_argument("--gamma", type=float, default=1.0, help="Depth gamma (>=0.1)")
+    ap.add_argument("--invert", action="store_true", help="Invert depth after normalization")
+    ap.add_argument("--strength", type=float, default=0.7, help="Blend strength 0..1")
+    # Fog options
+    ap.add_argument("--fog_color", type=str, default="200,220,255", help="Fog RGB as 'r,g,b'")
+    ap.add_argument("--contrast_falloff", type=float, default=0.3, help="0..1")
+    ap.add_argument("--sat_falloff", type=float, default=0.25, help="0..1")
+    # Hue options
+    ap.add_argument("--hue_degrees", type=float, default=60.0, help="Hue shift at max depth (degrees)")
+    # Gradient options
+    ap.add_argument("--palette", type=str, default="cyanotype", help="Preset name or 'r,g,b; r,g,b; ...'")
+    ap.add_argument("--preserve_luma", action="store_true", help="Keep original luminance in gradient mode")
+    args = ap.parse_args()
+
+    img = read_image(args.image)
+    depth_raw = read_depth(args.depth)
+
+    d = normalize_depth(depth_raw, near=args.near, far=args.far, gamma=max(args.gamma, 0.1), invert=args.invert)
+
+    if args.mode == "fog":
+        fog_rgb = [int(x) for x in args.fog_color.split(",")]
+        out = apply_fog(
+            img, d,
+            fog_color=rgb(*fog_rgb),
+            strength=np.clip(args.strength, 0, 1),
+            contrast_falloff=np.clip(args.contrast_falloff, 0, 1),
+            sat_falloff=np.clip(args.sat_falloff, 0, 1),
+        )
+    elif args.mode == "hue":
+        out = apply_hue_shift(
+            img, d,
+            hue_degrees=args.hue_degrees,
+            strength=np.clip(args.strength, 0, 1)
+        )
+    else:
+        # Palette parsing
+        if args.palette in PALETTES:
+            stops = PALETTES[args.palette]
+        else:
+            # parse "r,g,b; r,g,b; ..."
+            parts = args.palette.split(";")
+            stops = []
+            for p in parts:
+                r,g,b = [int(x.strip()) for x in p.strip().split(",")]
+                stops.append(rgb(r,g,b))
+            if len(stops) < 2:
+                raise ValueError("Provide at least two gradient stops.")
+        out = apply_gradient_map(
+            img, d,
+            stops=stops,
+            strength=np.clip(args.strength, 0, 1),
+            preserve_luma=args.preserve_luma
+        )
+
+    # Save (convert back to BGR for cv2.imwrite)
+    out_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(args.output, out_bgr)
+    print(f"Saved: {args.output}")
+
+if __name__ == "__main__":
+    main()
