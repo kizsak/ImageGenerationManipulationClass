@@ -1,0 +1,52 @@
+.film-strip {
+  display: flex;
+  flex-direction: column;
+  height: 20rem;
+  aspect-ratio: 8/7;
+  color: rgb(127,70,58);
+}
+
+.negative {
+  display: flex;
+  flex-grow: 1;
+  align-items: center;
+  justify-content: center;
+  padding: 3.5%;
+  background-color: currentColor;
+}
+
+.trail-top,
+.trail-bottom {
+  height: 10%;
+  width: 100%;
+  background-repeat: repeat-x;
+  box-shadow: 0px 3px 3px rgba(0,0,0,0.3);
+  background-size: 12.5% 100%;
+}
+
+.trail-top {
+  background-image: linear-gradient(to bottom, currentColor 40%, transparent 42%),
+                linear-gradient(to right, transparent 25%, currentColor 25%, currentColor 75%, transparent 75%);
+}
+
+.trail-bottom {
+    background-image: linear-gradient(to top, currentColor 40%, transparent 40%),
+                linear-gradient(to right, transparent 25%, currentColor 25%, currentColor 75%, transparent 75%);
+}
+
+.image-container {
+  position: relative;
+  aspect-ratio: 3/2;
+  width: 100%;
+  mix-blend-mode: multiply;
+  filter: invert(100%);
+}
+
+.image {
+  position:absolute;
+  width: 100%;
+  heigth: 100%;
+  top: 0;
+  left: 0;
+  object-fit: cover;
+}
